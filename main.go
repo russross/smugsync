@@ -167,7 +167,7 @@ func processAlbum(c *smugmug.Conn, album *smugmug.AlbumInfo) error {
 
 	// process each image
 	for _, img := range images {
-		if err := sync(album, img, localFiles, dir); err != nil {
+		if err := syncFile(album, img, localFiles, dir); err != nil {
 			return fmt.Errorf("Error processing image %s from album %s in category %s: %v",
 				img.FileName, album.Title, album.Category.Name, err)
 		}
@@ -186,7 +186,7 @@ func processAlbum(c *smugmug.Conn, album *smugmug.AlbumInfo) error {
 	return nil
 }
 
-func sync(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map[string]string, dir string) error {
+func syncFile(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map[string]string, dir string) error {
 	path := album.Category.Name
 	if album.SubCategory != nil {
 		path = filepath.Join(path, album.SubCategory.Name)
