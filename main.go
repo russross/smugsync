@@ -23,6 +23,7 @@ var (
 	dir      string
 	dry      bool
 	del      bool
+	fast     bool
 
 	fileCount  int
 	totalBytes int
@@ -38,6 +39,7 @@ func main() {
 	configString(&dir, "dir", "", "Target directory")
 	flag.BoolVar(&dry, "dry", false, "Dry run (no changes)")
 	flag.BoolVar(&del, "delete", true, "Delete local files")
+	flag.BoolVar(&fast, "fast", true, "Skip albums with timestamp match")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		log.Fatalf("Unknown command-line options: %s", strings.Join(flag.Args(), " "))
@@ -108,7 +110,27 @@ func main() {
 
 	// process each album
 	for _, ainfo := range albums {
-		log.Printf("Processing album %s in category %s [%s]", ainfo.Title, ainfo.Category.Name, ainfo.URL)
+		path := ainfo.Category.Name
+		if ainfo.SubCategory != nil {
+			path = filepath.Join(path, ainfo.SubCategory.Name)
+		}
+		path = filepath.Join(path, ainfo.Title)
+		fullpath := filepath.Join(dir, path)
+		updated, err := time.ParseInLocation("2006-01-02 15:04:05", ainfo.LastUpdated, time.Local)
+		if err != nil {
+			log.Fatalf("Unable to parse timestamp %q: %v", ainfo.LastUpdated, err)
+		}
+
+		// see if we can skip this based on a time stamp
+		if fast {
+			info, err := os.Stat(fullpath)
+			if err == nil && info.IsDir() && info.ModTime().Equal(updated) {
+				log.Printf("Skipping %s [%s], timestamp of %s matches", path, ainfo.URL, ainfo.LastUpdated)
+				continue
+			}
+		}
+
+		log.Printf("Processing %s [%s] (updated %s)", path, ainfo.URL, ainfo.LastUpdated)
 
 		// get full list of images from this album
 		images, err := c.Images(ainfo)
@@ -122,6 +144,11 @@ func main() {
 				log.Fatalf("Error processing image %s from album %s in category %s: %v",
 					img.FileName, ainfo.Title, ainfo.Category.Name, err)
 			}
+		}
+
+		// update the directory timestamp to match
+		if err = os.Chtimes(fullpath, updated, updated); err != nil {
+			log.Fatalf("failed to set timestamp on directory %s: %v", fullpath, err)
 		}
 	}
 
@@ -160,6 +187,16 @@ func sync(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map[str
 		return nil
 	}
 
+	if localFiles[path] != "" && isVideo(image.Format) {
+		log.Printf("    skipping existing video (assuming unchanged) %s", path)
+
+		// mark this local file as existing on the server
+		delete(localFiles, path)
+		delete(localFiles, filepath.Dir(path))
+
+		return nil
+	}
+
 	// file is new/changed, so download it
 	fullpath := filepath.Join(dir, path)
 
@@ -179,13 +216,29 @@ func sync(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map[str
 		return nil
 	}
 
-	resp, err := http.Get(image.OriginalURL)
+	url := image.OriginalURL
+	if isVideo(image.Format) {
+		if image.Video1920URL != "" {
+			url = image.Video1920URL
+		} else if image.Video1280URL != "" {
+			url = image.Video1280URL
+		} else if image.Video960URL != "" {
+			url = image.Video960URL
+		} else if image.Video640URL != "" {
+			url = image.Video640URL
+		} else if image.Video320URL != "" {
+			url = image.Video320URL
+		} else {
+			return fmt.Errorf("no valid url found for video")
+		}
+	}
+	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Errorf("error downloading %s: %v", image.OriginalURL, err)
+		return fmt.Errorf("error downloading %s: %v", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code downloading %s: %d", image.OriginalURL, resp.StatusCode)
+		return fmt.Errorf("unexpected status code downloading %s: %d", url, resp.StatusCode)
 	}
 
 	// create the directory if necessary
@@ -201,8 +254,8 @@ func sync(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map[str
 	if err != nil {
 		return fmt.Errorf("error saving file %s: %v", fullpath, err)
 	}
-	if int(size) != image.Size {
-		return fmt.Errorf("downloaded %d bytes from %s, expected %d", size, image.OriginalURL, image.Size)
+	if int(size) != image.Size && !isVideo(image.Format) {
+		return fmt.Errorf("downloaded %d bytes from %s, expected %d", size, url, image.Size)
 	}
 	if size > 1024*1024 {
 		log.Printf("    %s: downloaded %.1fm %s", path, float64(size)/(1024*1024), changed)
@@ -272,4 +325,15 @@ func configString(p *string, name, value, usage string) {
 
 	// pass it on to flag
 	flag.StringVar(p, name, *p, usage)
+}
+
+func isVideo(format string) bool {
+	if format == "MP4" {
+		return true
+	}
+	if format == "JPG" {
+		return false
+	}
+	log.Fatalf("unknown image format: %s", format)
+	return false
 }
