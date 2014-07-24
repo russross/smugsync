@@ -25,6 +25,8 @@ var (
 	del      bool
 	fast     bool
 	jobs     int
+	videos   bool
+	pics     bool
 
 	fileCount  int
 	totalBytes int
@@ -39,9 +41,11 @@ func main() {
 	configString(&password, "password", "", "Password")
 	configString(&dir, "dir", "", "Target directory")
 	flag.BoolVar(&dry, "dry", false, "Dry run (no changes)")
-	flag.BoolVar(&del, "delete", true, "Delete local files")
+	flag.BoolVar(&del, "delete", true, "Delete local files not in album")
 	flag.BoolVar(&fast, "fast", true, "Skip albums with timestamp match")
-	flag.IntVar(&jobs, "jobs", 5, "Number of concurrent jobs to run")
+	flag.BoolVar(&videos, "videos", true, "Download videos")
+	flag.BoolVar(&pics, "pics", true, "Download pictures")
+	flag.IntVar(&jobs, "jobs", 1, "Number of concurrent jobs to run")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		log.Fatalf("Unknown command-line options: %s", strings.Join(flag.Args(), " "))
@@ -74,18 +78,19 @@ func main() {
 
 	// process each album
 	rate := make(chan struct{}, jobs)
-	done := make(chan struct{}, len(albums))
 	for _, album := range albums {
+		rate <- struct{}{}
 		go func(album *smugmug.AlbumInfo) {
-			rate <- struct{}{}
 			if err := processAlbum(c, album); err != nil {
 				log.Fatalf("Error processing album %s: %v", album.URL, err)
 			}
-			done <- <-rate
+			<-rate
 		}(album)
 	}
-	for _ = range albums {
-		<-done
+
+	// wait for remaining jobs to finish
+	for i := 0; i < jobs; i++ {
+		rate <- struct{}{}
 	}
 
 	if totalBytes > 1024*1024 {
@@ -179,8 +184,10 @@ func processAlbum(c *smugmug.Conn, album *smugmug.AlbumInfo) error {
 	}
 
 	// update the directory timestamp to match
-	if err = os.Chtimes(fullpath, updated, updated); err != nil {
-		return fmt.Errorf("failed to set timestamp on directory %s: %v", fullpath, err)
+	if !dry {
+		if err = os.Chtimes(fullpath, updated, updated); err != nil {
+			return fmt.Errorf("failed to set timestamp on directory %s: %v", fullpath, err)
+		}
 	}
 
 	return nil
@@ -196,6 +203,23 @@ func syncFile(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map
 		path = filepath.Join(path, image.FileName)
 	} else {
 		return fmt.Errorf("image with no filename: ID=%d Key=%s Album=%v", image.ID, image.Key, image.Album)
+	}
+
+	// skip based on type of file
+	if isVideo(image.Format) && !videos {
+		log.Printf("    skipping video file %s", path)
+		// mark this local file as existing on the server
+		delete(localFiles, path)
+		delete(localFiles, filepath.Dir(path))
+
+		return nil
+	} else if !isVideo(image.Format) && !pics {
+		log.Printf("    skipping picture file %s", path)
+		// mark this local file as existing on the server
+		delete(localFiles, path)
+		delete(localFiles, filepath.Dir(path))
+
+		return nil
 	}
 
 	if localFiles[path] == image.MD5Sum {
@@ -352,12 +376,13 @@ func configString(p *string, name, value, usage string) {
 }
 
 func isVideo(format string) bool {
-	if format == "MP4" {
+	switch format {
+	case "MP4", "AVI":
 		return true
-	}
-	if format == "JPG" {
+	case "JPG", "PNG", "GIF":
 		return false
+	default:
+		log.Fatalf("unknown image format: %s", format)
 	}
-	log.Fatalf("unknown image format: %s", format)
 	return false
 }
