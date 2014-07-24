@@ -24,6 +24,7 @@ var (
 	dry      bool
 	del      bool
 	fast     bool
+	jobs     int
 
 	fileCount  int
 	totalBytes int
@@ -40,6 +41,7 @@ func main() {
 	flag.BoolVar(&dry, "dry", false, "Dry run (no changes)")
 	flag.BoolVar(&del, "delete", true, "Delete local files")
 	flag.BoolVar(&fast, "fast", true, "Skip albums with timestamp match")
+	flag.IntVar(&jobs, "jobs", 5, "Number of concurrent jobs to run")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		log.Fatalf("Unknown command-line options: %s", strings.Join(flag.Args(), " "))
@@ -63,44 +65,6 @@ func main() {
 	}
 	log.Printf("Logged in %s, NickName is %s", email, c.NickName)
 
-	// scan the local directory: map path to md5sum
-	log.Printf("Scanning local file system, this may take some time")
-	localFiles := make(map[string]string)
-	if err := filepath.Walk(dir, filepath.WalkFunc(func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		suffix := path
-		if strings.HasPrefix(path, dir+"/") {
-			suffix = path[len(dir)+1:]
-		}
-
-		if info.IsDir() {
-			localFiles[suffix] = "directory"
-			return nil
-		}
-
-		// get an MD5 hash
-		h := md5.New()
-		f, err := os.Open(path)
-		if err != nil {
-			log.Printf("error opening %s: %v", path, err)
-			return err
-		}
-		defer f.Close()
-		if _, err = io.Copy(h, f); err != nil {
-			log.Printf("error reading %s: %v", path, err)
-			return err
-		}
-		sum := h.Sum(nil)
-		s := hex.EncodeToString(sum)
-		localFiles[suffix] = s
-		return nil
-	})); err != nil {
-		log.Fatalf("error walking local file system: %v", err)
-	}
-
 	// get full list of albums
 	albums, err := c.Albums(c.NickName)
 	if err != nil {
@@ -109,51 +73,19 @@ func main() {
 	log.Printf("Found %d albums", len(albums))
 
 	// process each album
-	for _, ainfo := range albums {
-		path := ainfo.Category.Name
-		if ainfo.SubCategory != nil {
-			path = filepath.Join(path, ainfo.SubCategory.Name)
-		}
-		path = filepath.Join(path, ainfo.Title)
-		fullpath := filepath.Join(dir, path)
-		updated, err := time.ParseInLocation("2006-01-02 15:04:05", ainfo.LastUpdated, time.Local)
-		if err != nil {
-			log.Fatalf("Unable to parse timestamp %q: %v", ainfo.LastUpdated, err)
-		}
-
-		// see if we can skip this based on a time stamp
-		if fast {
-			info, err := os.Stat(fullpath)
-			if err == nil && info.IsDir() && info.ModTime().Equal(updated) {
-				log.Printf("Skipping %s [%s], timestamp of %s matches", path, ainfo.URL, ainfo.LastUpdated)
-				continue
+	rate := make(chan struct{}, jobs)
+	done := make(chan struct{}, len(albums))
+	for _, album := range albums {
+		go func(album *smugmug.AlbumInfo) {
+			rate <- struct{}{}
+			if err := processAlbum(c, album); err != nil {
+				log.Fatalf("Error processing album %s: %v", album.URL, err)
 			}
-		}
-
-		log.Printf("Processing %s [%s] (updated %s)", path, ainfo.URL, ainfo.LastUpdated)
-
-		// get full list of images from this album
-		images, err := c.Images(ainfo)
-		if err != nil {
-			log.Fatalf("Images error: %v", err)
-		}
-
-		// process each image
-		for _, img := range images {
-			if err := sync(ainfo, img, localFiles, dir); err != nil {
-				log.Fatalf("Error processing image %s from album %s in category %s: %v",
-					img.FileName, ainfo.Title, ainfo.Category.Name, err)
-			}
-		}
-
-		// update the directory timestamp to match
-		if err = os.Chtimes(fullpath, updated, updated); err != nil {
-			log.Fatalf("failed to set timestamp on directory %s: %v", fullpath, err)
-		}
+			done <- <-rate
+		}(album)
 	}
-
-	if err = cleanup(localFiles, dir); err != nil {
-		log.Fatalf("Error cleaning up: %v", err)
+	for _ = range albums {
+		<-done
 	}
 
 	if totalBytes > 1024*1024 {
@@ -163,6 +95,95 @@ func main() {
 	} else {
 		log.Printf("Downloaded %d files (%d bytes) in %v", fileCount, totalBytes, time.Since(start))
 	}
+}
+
+func processAlbum(c *smugmug.Conn, album *smugmug.AlbumInfo) error {
+	path := album.Category.Name
+	if album.SubCategory != nil {
+		path = filepath.Join(path, album.SubCategory.Name)
+	}
+	path = filepath.Join(path, album.Title)
+	fullpath := filepath.Join(dir, path)
+	updated, err := time.ParseInLocation("2006-01-02 15:04:05", album.LastUpdated, time.Local)
+	if err != nil {
+		return fmt.Errorf("Unable to parse timestamp %q: %v", album.LastUpdated, err)
+	}
+
+	// see if we can skip this based on a time stamp
+	if fast {
+		info, err := os.Stat(fullpath)
+		if err == nil && info.IsDir() && info.ModTime().Equal(updated) {
+			log.Printf("Skipping %s [%s], timestamp of %s matches", path, album.URL, album.LastUpdated)
+			return nil
+		}
+	}
+
+	log.Printf("Processing %s [%s] (updated %s)", path, album.URL, album.LastUpdated)
+
+	// scan the local directory: map path to md5sum
+	localFiles := make(map[string]string)
+	if info, err := os.Stat(fullpath); err == nil && info.IsDir() {
+		if err := filepath.Walk(fullpath, filepath.WalkFunc(func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			suffix := path
+			if strings.HasPrefix(path, dir+"/") {
+				suffix = path[len(dir)+1:]
+			}
+
+			if info.IsDir() {
+				localFiles[suffix] = "directory"
+				return nil
+			}
+
+			// get an MD5 hash
+			h := md5.New()
+			f, err := os.Open(path)
+			if err != nil {
+				log.Printf("error opening %s: %v", path, err)
+				return err
+			}
+			defer f.Close()
+			if _, err = io.Copy(h, f); err != nil {
+				log.Printf("error reading %s: %v", path, err)
+				return err
+			}
+			sum := h.Sum(nil)
+			s := hex.EncodeToString(sum)
+			localFiles[suffix] = s
+			return nil
+		})); err != nil && err != os.ErrNotExist {
+			return fmt.Errorf("error walking local file system: %v", err)
+		}
+	}
+
+	// get full list of images from this album
+	images, err := c.Images(album)
+	if err != nil {
+		return fmt.Errorf("Images error: %v", err)
+	}
+
+	// process each image
+	for _, img := range images {
+		if err := sync(album, img, localFiles, dir); err != nil {
+			return fmt.Errorf("Error processing image %s from album %s in category %s: %v",
+				img.FileName, album.Title, album.Category.Name, err)
+		}
+	}
+
+	// delete extra files
+	if err = cleanup(localFiles, dir); err != nil {
+		return fmt.Errorf("Error cleaning up: %v", err)
+	}
+
+	// update the directory timestamp to match
+	if err = os.Chtimes(fullpath, updated, updated); err != nil {
+		return fmt.Errorf("failed to set timestamp on directory %s: %v", fullpath, err)
+	}
+
+	return nil
 }
 
 func sync(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map[string]string, dir string) error {
@@ -305,7 +326,10 @@ func cleanup(localFiles map[string]string, dir string) error {
 		}
 	}
 
-	log.Printf("removed %d files and directories", len(localFiles))
+	if len(localFiles) > 0 {
+		log.Printf("removed %d files and directories", len(localFiles))
+	}
+
 	return nil
 }
 
