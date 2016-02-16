@@ -202,7 +202,7 @@ func syncFile(album *smugmug.AlbumInfo, image *smugmug.ImageInfo, localFiles map
 	if image.FileName != "" {
 		path = filepath.Join(path, image.FileName)
 	} else {
-		return fmt.Errorf("image with no filename: ID=%d Key=%s Album=%v", image.ID, image.Key, image.Album)
+		path = filepath.Join(path, fmt.Sprintf("%s-%d.jpg", image.Key, image.ID))
 	}
 
 	// skip based on type of file
