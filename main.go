@@ -143,20 +143,12 @@ func processAlbum(c *smugmug.Conn, album *smugmug.AlbumInfo) error {
 				return nil
 			}
 
-			// get an MD5 hash
-			h := md5.New()
-			f, err := os.Open(path)
+			s, err := md5HashOfFile(path)
 			if err != nil {
-				log.Printf("error opening %s: %v", path, err)
+				log.Printf("error getting md5 hash of %s: %v", path, err)
 				return err
 			}
-			defer f.Close()
-			if _, err = io.Copy(h, f); err != nil {
-				log.Printf("error reading %s: %v", path, err)
-				return err
-			}
-			sum := h.Sum(nil)
-			s := hex.EncodeToString(sum)
+
 			localFiles[suffix] = s
 			return nil
 		})); err != nil && err != os.ErrNotExist {
@@ -186,7 +178,7 @@ func processAlbum(c *smugmug.Conn, album *smugmug.AlbumInfo) error {
 	// update the directory timestamp to match
 	if !dry {
 		if err = os.Chtimes(fullpath, updated, updated); err != nil {
-			return fmt.Errorf("failed to set timestamp on directory %s: %v", fullpath, err)
+			log.Printf("failed to set timestamp on directory %s: %v", fullpath, err)
 		}
 	}
 
@@ -329,6 +321,7 @@ func cleanup(localFiles map[string]string, dir string) error {
 			log.Printf("dry run, not removing file %s", k)
 		} else {
 			fullpath := filepath.Join(dir, k)
+			log.Printf("removing file %s", fullpath)
 			if err := os.Remove(fullpath); err != nil {
 				return fmt.Errorf("error removing file %s: %v", fullpath, err)
 			}
@@ -344,6 +337,7 @@ func cleanup(localFiles map[string]string, dir string) error {
 			log.Printf("dry run, not removing directory %s", k)
 		} else {
 			fullpath := filepath.Join(dir, k)
+			log.Printf("removing directory %s", fullpath)
 			if err := os.Remove(fullpath); err != nil {
 				return fmt.Errorf("error removing directory %s: %v", fullpath, err)
 			}
@@ -385,4 +379,21 @@ func isVideo(format string) bool {
 		log.Fatalf("unknown image format: %s", format)
 	}
 	return false
+}
+
+func md5HashOfFile(path string) (string, error) {
+	// get an MD5 hash
+	h := md5.New()
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("error opening %s: %v", path, err)
+		return "", err
+	}
+	defer f.Close()
+	if _, err = io.Copy(h, f); err != nil {
+		log.Printf("error reading %s: %v", path, err)
+		return "", err
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum), nil
 }
